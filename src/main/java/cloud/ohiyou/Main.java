@@ -1,12 +1,9 @@
 package cloud.ohiyou;
 
-/**
- * @author ohiyou
- * @since 2024/3/1 14:19
- */
-
-import cloud.ohiyou.utils.DingTalkUtils;
-import cloud.ohiyou.utils.WeChatWorkUtils;
+import cloud.ohiyou.config.EnvConfig;
+import cloud.ohiyou.factory.PushStrategyFactory;
+import cloud.ohiyou.service.IMessagePushStrategy;
+import cloud.ohiyou.utils.OkHttpUtils;
 import cloud.ohiyou.vo.CookieSignResult;
 import cloud.ohiyou.vo.SignResultVO;
 import com.alibaba.fastjson.JSON;
@@ -15,7 +12,6 @@ import okhttp3.*;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -24,26 +20,19 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class Main {
-    private static final String COOKIE = System.getenv("COOKIE");
-//    private static final String COOKIE = cloud.ohiyou.test.TestEnum.COOKIE.getValue();
-    private static final String DINGTALK_WEBHOOK = System.getenv("DINGTALK_WEBHOOK"); // 钉钉机器人 access_token 的值
-    private static final String WXWORK_WEBHOOK = System.getenv("WXWORK_WEBHOOK"); // 企业微信机器人 key 的值
-    private static final String SERVER_CHAN_KEY = System.getenv("SERVER_CHAN");
-    private static final OkHttpClient client = new OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
-            .build();
+    private static final OkHttpClient client = OkHttpUtils.getClient();
 
     public static void main(String[] args) {
         List<CookieSignResult> results = Collections.synchronizedList(new ArrayList<>());
-        if (COOKIE == null) {
+        String cookies = EnvConfig.get().getCookie();
+        if (cookies == null) {
             throw new RuntimeException("未设置Cookie");
         }
 
-        String[] cookiesArray = COOKIE.split("&");
+        String[] cookiesArray = cookies.split("&");
         log("检测到 " + cookiesArray.length + " 个cookie");
 
+        // 创建一个固定线程数的线程池
         ExecutorService executor = Executors.newFixedThreadPool(5);
         List<Future<?>> futures = new ArrayList<>();
         for (int i = 0; i < cookiesArray.length; i++) {
@@ -51,9 +40,18 @@ public class Main {
             final int index = i;
             Future<?> future = executor.submit(() -> {
                 try {
-                    processCookie(cookie, index, results);
+                    long startTime = System.currentTimeMillis();
+                    // 格式化cookie,去除掉空格 空字符串等，同时也检测cookie的格式
+                    String formattedCookie = formatCookie(cookie.trim(), index);
+                    if (formattedCookie != null) {
+                        SignResultVO signResultVO = sendSignInRequest(formattedCookie);
+                        long endTime = System.currentTimeMillis();
+                        results.add(new CookieSignResult(signResultVO, endTime - startTime));
+                    }
                 } catch (Exception e) {
                     log("Error processing cookie at index " + index + ": " + e.getMessage());
+                    // 添加消息失败的结果
+                    results.add(new CookieSignResult(new SignResultVO(401, "签到失败,cookie失效"), 0));
                 }
             });
             futures.add(future);
@@ -86,54 +84,59 @@ public class Main {
         } catch (InterruptedException e) {
             executor.shutdownNow();
         }
+        publishResults(results);
 
+        // 关闭OkHttpClient
         client.dispatcher().executorService().shutdownNow();
         client.connectionPool().evictAll();
-
-        publishResults(results);
     }
 
-    private static void processCookie(String cookie, int index, List<CookieSignResult> results) {
-        long startTime = System.currentTimeMillis();
-        String formattedCookie = formatCookie(cookie.trim(), index);
-        if (formattedCookie != null) {
-            SignResultVO signResultVO = sendSignInRequest(formattedCookie);
-            long endTime = System.currentTimeMillis();
-            results.add(new CookieSignResult(signResultVO, endTime - startTime));
-        }
-    }
-
+    /**
+     * 推送签到结果
+     *
+     * @param results results，每个cookie的签到结果
+     */
     private static void publishResults(List<CookieSignResult> results) {
         StringBuilder messageBuilder = new StringBuilder();
-        boolean allSuccess = true; // 假设所有签到都成功，直到发现失败的签到
+        boolean allSuccess = true;
 
-        for (CookieSignResult result : results) {
-            messageBuilder.append(result.getSignResult().getUserName()).append(": ")
-                    .append("\n签到结果: ").append(result.getSignResult().getMessage())
-                    .append("\n耗时: ").append(result.getDuration()).append("ms\n\n");
-            // 检查每个签到结果，如果有失败的，则设置allSuccess为false
-            if (!result.getSignResult().getMessage().contains("成功签到")) {
-                allSuccess = false;
+        if (results == null || results.isEmpty()) {
+            allSuccess = false;
+            messageBuilder.append("未获取到任何签到结果，请检查任务执行情况。\n");
+        } else {
+            for (CookieSignResult result : results) {
+                messageBuilder.append(result.getSignResult().getUserName()).append(": ")
+                        .append("\n签到结果: ").append(result.getSignResult().getMessage())
+                        .append("\n耗时: ").append(result.getDuration()).append("ms\n\n");
+                if (!result.getSignResult().getMessage().contains("成功签到")) {
+                    allSuccess = false;
+                }
             }
         }
 
-        String title = allSuccess ? "签到成功" : "签到失败"; // 根据所有签到结果决定标题
+        String title = allSuccess ? "HiFiNi签到成功" : "HiFiNi签到失败";
+
+        System.out.println("\nHiFiNi签到消息: \n" + title + "：\n" + messageBuilder);
+
         // 推送
-        publishWechat(SERVER_CHAN_KEY, title,messageBuilder.toString());
-        DingTalkUtils.pushBotMessage(DINGTALK_WEBHOOK, title, messageBuilder.toString(), "", "markdown");
-        WeChatWorkUtils.pushBotMessage(WXWORK_WEBHOOK, title, messageBuilder.toString(), "markdown");
+        List<IMessagePushStrategy> strategies = PushStrategyFactory.getStrategy();
+        for (IMessagePushStrategy strategy : strategies) {
+            strategy.pushMessage(title, messageBuilder.toString());
+        }
     }
 
 
-
+    /**
+     * 携带cookie模拟访问网页,执行签到
+     *
+     * @param cookie cookie
+     * @return 签到返回的结果
+     */
     private static SignResultVO sendSignInRequest(String cookie) {
         // 获取签到页面
         String signPageCode = getSignPage(cookie);
         String sign = getSign(signPageCode);
         String userName = getUserName(signPageCode);
-        // 获取加密参数
-//        String dynamicKey = HiFiNiEncryptUtil.generateDynamicKey();
-//        String encryptedSign = HiFiNiEncryptUtil.simpleEncrypt(sign, dynamicKey);
 
         RequestBody formBody = new FormBody.Builder()
                 .add("sign", sign)
@@ -150,7 +153,6 @@ public class Main {
             if (!response.isSuccessful()) {
                 throw new IOException("Unexpected code " + response);
             }
-            ;
             String result = readResponse(response);
             SignResultVO signResultVO = stringToObject(result, SignResultVO.class);
             signResultVO.setUserName(userName);
@@ -175,6 +177,12 @@ public class Main {
         return userName;
     }
 
+    /**
+     * 获取sign值
+     *
+     * @param signPageCode 网页数据
+     * @return String
+     */
     private static String getSign(String signPageCode) {
         // 通过正则获取sign的值
         if (signPageCode.contains("请登录")) {
@@ -196,10 +204,10 @@ public class Main {
     }
 
     /**
-     * 获取加密的key
+     * 携带cookie，获取网页数据
      *
      * @param cookie cookie
-     * @return String
+     * @return sign
      */
     private static String getSignPage(String cookie) {
         // 先携带cookie访问一次签到页面获取sign
@@ -218,6 +226,14 @@ public class Main {
         throw new RuntimeException("未能获取sign,请检查cookie是否失效");
     }
 
+    /**
+     * 检测cookie的格式，是否是  bbs_sid,bbs_token,否则cookie是无效的；
+     * 去除掉多余的空格,空字符串
+     *
+     * @param cookie cookie
+     * @param index  index
+     * @return formatCookie
+     */
     private static String formatCookie(String cookie, int index) {
         String bbsSid = null;
         String bbsToken = null;
@@ -254,36 +270,21 @@ public class Main {
     }
 
     private static String readResponse(Response response) throws IOException {
-        BufferedReader reader = new BufferedReader(new InputStreamReader(response.body().byteStream()));
-        StringBuilder result = new StringBuilder();
-        String readLine;
-        while ((readLine = reader.readLine()) != null) {
-            result.append(readLine);
+        if (response.body() == null) {
+            throw new IOException("Response body is null");
         }
-        return result.toString();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(response.body().byteStream()))) {
+            StringBuilder result = new StringBuilder();
+            String readLine;
+            while ((readLine = reader.readLine()) != null) {
+                result.append(readLine);
+            }
+            return result.toString();
+        }
     }
 
 
     private static <T> T stringToObject(String result, Class<T> clazz) {
         return JSON.parseObject(result, clazz);
     }
-
-    private static void publishWechat(String serverChanKey, String title, String body) {
-        if (serverChanKey == null) {
-            log("SERVER_CHAN 环境变量未设置");
-            return;
-        }
-
-        try {
-            String url = "https://sctapi.ftqq.com/" + serverChanKey + ".send?title=" +
-                    URLEncoder.encode(title, "UTF-8") + "&desp=" + URLEncoder.encode(body, "UTF-8");
-            Request request = new Request.Builder()
-                    .url(url)
-                    .build();
-            client.newCall(request).execute();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
 }
